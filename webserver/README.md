@@ -1,3 +1,6 @@
+# Build your own Web Server 
+This repository contains the code created by following the [BYO Web Server](https://build-your-own.org/webserver/) book. 
+
 ### Testing
 
 Run the following to generate a test file:
