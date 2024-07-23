@@ -201,21 +201,32 @@ function encodeHTTPResp(msg: HTTPRes): Buffer {
 
 // send an HTTP response through the socket
 async function writeHTTPResp(conn: TCPConn, resp: HTTPRes): Promise<void> {
+  // set the "Content-Length" or "Transfer-Encoding" field
   if (resp.body.length < 0) {
-    throw new Error("TODO: chunked encoding");
+    resp.headers.push(Buffer.from("Transfer-Encoding: chunked"));
+  } else {
+    resp.headers.push(Buffer.from(`Content-Length: ${resp.body.length}`));
   }
-  // set the "Content-Length" field
-  console.assert(!fieldGet(resp.headers, "Content-Length"));
-  resp.headers.push(Buffer.from(`Content-Length: ${resp.body.length}`));
+
   // write the header
   await soWrite(conn, encodeHTTPResp(resp));
   // write the body
-  while (true) {
-    const data = await resp.body.read();
-    if (data.length === 0) {
-      break;
+  const crlf = Buffer.from("\r\n");
+  for (let last = false; !last; ) {
+    let data = await resp.body.read();
+    last = data.length === 0; // ended?
+    if (resp.body.length < 0) {
+      // chunked encoding
+      data = Buffer.concat([
+        Buffer.from(data.length.toString(16)),
+        crlf,
+        data,
+        crlf,
+      ]);
     }
-    await soWrite(conn, data);
+    if (data.length) {
+      await soWrite(conn, data);
+    }
   }
 }
 
@@ -274,6 +285,116 @@ function readerFromConnLength(
   };
 }
 
+type BufferGenerator = AsyncGenerator<Buffer, void, void>;
+
+async function* countSheep(): BufferGenerator {
+  for (let i = 0; i < 100; i++) {
+    // sleep 1s, then output the counter
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    yield Buffer.from(`${i}\n`);
+  }
+}
+
+async function bufExpectMore(
+  conn: TCPConn,
+  buf: DynBuf,
+  where: string
+): Promise<void> {
+  const data = await soRead(conn);
+  bufPush(buf, data);
+  if (data.length === 0) {
+    throw new HTTPError(400, `Unexpected EOF in ${where}`);
+  }
+}
+
+function isHex(s: string): boolean {
+  for (const c of s) {
+    const valid =
+      ("0" <= c && c <= "9") ||
+      ("a" <= c && c <= "f") ||
+      ("A" <= c && c <= "F");
+    if (!valid) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// decode the chunked encoding and yield the data on the fly
+async function* readChunks(conn: TCPConn, buf: DynBuf): BufferGenerator {
+  for (let last = false; !last; ) {
+    // read the chunk-size line
+    const idx = buf.data.subarray(0, buf.length).indexOf("\r\n");
+    if (idx < 0) {
+      if (buf.length > 32) {
+        throw new HTTPError(400, "expect chunk-size");
+      }
+      await bufExpectMore(conn, buf, "chunk-size");
+      continue;
+    }
+    const chunkSize = buf.data.subarray(0, idx).toString("latin1");
+    if (!isHex(chunkSize)) {
+      throw new HTTPError(400, "expect hex digits");
+    }
+    let remain = parseInt(chunkSize, 16);
+    bufPop(buf, chunkSize.length + 2);
+    // is it the last one?
+    last = remain === 0;
+
+    // read and yield the chunk data
+    while (remain > 0) {
+      if (buf.length === 0) {
+        await bufExpectMore(conn, buf, "chunk data");
+      }
+
+      const consume = Math.min(remain, buf.length);
+      const data = Buffer.from(buf.data.subarray(0, consume));
+      bufPop(buf, consume);
+      remain -= consume;
+      yield data;
+    }
+
+    // the chunk data is followed by CRLF
+    while (buf.length < 2) {
+      await bufExpectMore(conn, buf, "chunk CRLF");
+    }
+    if ("\r\n" !== buf.data.subarray(0, 2).toString("latin1")) {
+      throw new HTTPError(400, "expect CRLF");
+    }
+    bufPop(buf, 2);
+  }
+}
+
+function readerFromGenerator(gen: BufferGenerator): BodyReader {
+  return {
+    length: -1,
+    read: async (): Promise<Buffer> => {
+      const r = await gen.next();
+      if (r.done) {
+        return Buffer.from("");
+      } else if (r.value instanceof Buffer) {
+        return r.value;
+      }
+    },
+  };
+}
+
+function readerFromConnEOF(conn: TCPConn, buf: DynBuf): BodyReader {
+  return {
+    length: -1,
+    read: async (): Promise<Buffer> => {
+      if (buf.length > 0) {
+        // copy buffer contents
+        const data = Buffer.from(buf.data.subarray(0, buf.length));
+        // clear the buffer
+        bufPop(buf, buf.length);
+        return data;
+      }
+      return await soRead(conn);
+    },
+  };
+}
+
 // parses a decimal number. returns NaN if failed.
 function parseDec(s: string): number {
   for (const ch of s) {
@@ -311,10 +432,10 @@ function readerFromReq(conn: TCPConn, buf: DynBuf, req: HTTPReq): BodyReader {
     return readerFromConnLength(conn, buf, bodyLen);
   } else if (chunked) {
     // chunked encoding
-    throw new HTTPError(501, "TODO");
+    return readerFromGenerator(readChunks(conn, buf));
   } else {
     // read the rest of the connection
-    throw new HTTPError(501, "TODO");
+    return readerFromConnEOF(conn, buf);
   }
 }
 
@@ -326,6 +447,9 @@ async function handleReq(req: HTTPReq, body: BodyReader): Promise<HTTPRes> {
     case "/echo":
       // http echo server
       resp = body;
+      break;
+    case "/sheep":
+      resp = readerFromGenerator(countSheep());
       break;
     default:
       resp = readerFromMemory(Buffer.from("hello world.\n"));
